@@ -23,6 +23,7 @@ contract Multisig {
         _;
     }
 
+    //enter minimum contribution amount when deployed
     constructor(uint256 minimum) public {
         manager = msg.sender;
         minimumContribution = minimum;
@@ -32,7 +33,7 @@ contract Multisig {
     function contribute() public payable {
         require(
             msg.value > minimumContribution,
-            "you need to deposit more than 0.1 ether"
+            "you need to deposit more ether"
         );
         approvers[msg.sender] = true;
         approversCount++;
