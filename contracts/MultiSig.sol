@@ -1,98 +1,182 @@
-pragma solidity ^0.6.0;
+pragma solidity >=0.8.0 <0.9.0;
 
-contract Multisig {
-    address public manager;
+contract MultiSigWallet {
+    event Deposit(address indexed sender, uint256 amount);
+    event Submin(uint256 indexed txId);
+    event Approve(address indexed owner, uint256 indexed txId);
+    event Revoke(address indexed owner, uint256 indexed txId);
+    event Execute(uint256 indexed txId);
 
-    uint256 public minimumContribution;
-
-    //This represents a stucture for a new Kickstarter campaing
-    struct Request {
+    struct Transaction {
+        address to;
         uint256 value;
-        address payable recepient;
-        bool complete;
-        uint256 approvalCount;
-        mapping(address => bool) approvals;
+        bytes data;
+        bool executed;
     }
 
-    Request[] public requests;
-    mapping(address => bool) public approvers;
-    uint256 public approversCount;
+    struct Participant {
+        address who;
+        uint8 votes;
+    }
 
-    modifier restricted() {
-        require(msg.sender == manager);
+    address[] public owners;
+    mapping(address => bool) public isOwner;
+    mapping(address => bool) public isParticipant;
+    mapping(address => Participant) public participants;
+    mapping(address => mapping(address => bool)) voted;
+    uint256 public required;
+
+    Transaction[] public transactions;
+
+    address[] public participantsArray;
+
+    mapping(uint256 => mapping(address => bool)) public approved;
+
+    modifier onlyOwner() {
+        require(isOwner[msg.sender], "not owner");
+        _;
+    }
+    modifier txExists(uint256 _txId) {
+        require(_txId < transactions.length, "tx not found");
         _;
     }
 
-    //enter minimum contribution amount when deployed
-    constructor(uint256 minimum) public {
-        manager = msg.sender;
-        minimumContribution = minimum;
+    modifier notApproved(uint256 _txId) {
+        require(!approved[_txId][msg.sender], "tx was already approved");
+        _;
     }
 
-    //function that allows a person to became a voter
-    function contribute() public payable {
-        require(
-            msg.value > minimumContribution,
-            "you need to deposit more ether"
-        );
-        approvers[msg.sender] = true;
-        approversCount++;
+    modifier notExecuted(uint256 _txId) {
+        require(!transactions[_txId].executed, "tx was executed");
+        _;
     }
 
-    //This functions helps manager to create a request for sending funds to another wallet
-    function createRequest(uint256 value, address payable recepient)
-        public
-        restricted
-    {
+    constructor(address[] memory _owners, uint256 _required) public {
+        require(_owners.length > 0, "owners required");
         require(
-            value <= address(this).balance,
-            "balance of the contract is less than proposed value"
+            _required > 0 && _required <= _owners.length,
+            "owners required"
         );
-        Request memory newRequest = Request({
-            value: value,
-            recepient: recepient,
-            approvalCount: 0,
-            complete: false
-        });
 
-        requests.push(newRequest);
+        for (uint256 i; i < _owners.length; i++) {
+            address owner = _owners[i];
+            require(owner != address(0), "invalid address");
+            require(!isOwner[owner], "address registered");
+
+            isOwner[owner] = true;
+            owners.push(owner);
+        }
+        required = _required;
     }
 
-    //Voting mechanism for deciding whether the participants/contributors allow the transaction
+    receive() external payable {
+        emit Deposit(msg.sender, msg.value);
+    }
 
-    function approveRequest(uint256 index) public {
-        Request storage request = requests[index];
-
-        require(
-            approvers[msg.sender],
-            "You are not among approvers, donate to contract"
+    function submit(
+        address _to,
+        uint256 _value,
+        bytes calldata _data
+    ) external onlyOwner {
+        transactions.push(
+            Transaction({to: _to, value: _value, data: _data, executed: false})
         );
-        require(!request.approvals[msg.sender], "You have already voted!");
+        emit Submin(transactions.length - 1);
+    }
 
-        request.approvals[msg.sender] = true;
-        request.approvalCount++;
-        if (request.approvalCount > (approversCount / 2)) {
-            finalizeRequest(index);
+    function approve(
+        uint256 _txId
+    ) external onlyOwner notApproved(_txId) txExists(_txId) notExecuted(_txId) {
+        approved[_txId][msg.sender] = true;
+        emit Approve(msg.sender, _txId);
+    }
+
+    function _getApprovalCount(
+        uint256 _txId
+    ) private view returns (uint256 count) {
+        for (uint256 i; i < owners.length; i++) {
+            if (approved[_txId][owners[i]]) {
+                count += 1;
+            }
         }
     }
 
-    //This function helps the  manager close the request based on either approved or rejected outcome
+    function execute(
+        uint256 _txId
+    ) external txExists(_txId) notExecuted(_txId) onlyOwner {
+        require(_getApprovalCount(_txId) >= required, "not enough approvals");
 
-    function finalizeRequest(uint256 index) public restricted {
-        Request storage request = requests[index];
+        Transaction storage transaction = transactions[_txId];
 
-        require(!request.complete, "This request has already been complete!");
-        require(
-            request.approvalCount > (approversCount / 2),
-            "Not enough votes to end the voting! "
+        transaction.executed = true;
+        (bool success, ) = transaction.to.call{value: transaction.value}(
+            transaction.data
         );
+        require(success, "tx failed");
+
+        emit Execute(_txId);
+    }
+
+    function revoke(
+        uint256 _txId
+    ) external txExists(_txId) notExecuted(_txId) onlyOwner {
+        require(approved[_txId][msg.sender], "tx not approved");
+        approved[_txId][msg.sender] = false;
+        emit Revoke(msg.sender, _txId);
+    }
+
+    function addParticipant(
+        address _participant
+    ) external onlyOwner returns (uint256) {
+        require(!isParticipant[_participant], "already participant");
+        isParticipant[_participant] = true;
+        voted[msg.sender][_participant] = true;
+        participants[_participant] = Participant({who: _participant, votes: 1});
+        participantsArray.push(_participant);
+        return participantsArray.length - 1;
+    }
+
+    function addOwner(address _participant) external onlyOwner {
+        Participant storage participant = participants[_participant];
+        require(participant.votes > 0, "No votes for participant");
         require(
-            request.value <= address(this).balance,
-            "not enough funds to send"
+            ((owners.length / participant.votes) % 2) > 0,
+            "votes not enough"
         );
-        request.recepient.transfer(request.value);
-        request.complete = true;
-        //delete request
-        // delete requests[index];
+        isParticipant[_participant] = false;
+        participants[_participant].who = address(0x0);
+        participants[_participant].votes = 0;
+        isOwner[_participant] = true;
+        owners.push(_participant);
+    }
+
+    function voteForParticipant(address _participant) external onlyOwner {
+        require(!voted[msg.sender][_participant], "already voted");
+        require(isParticipant[_participant], "address is not a participant");
+        Participant storage participant = participants[_participant];
+        participant.votes += 1;
+    }
+
+    function getAllOwners() public view returns (address[] memory) {
+        return owners;
+    }
+
+    function getAllproposedTransactions()
+        public
+        view
+        returns (Transaction[] memory)
+    {
+        return transactions;
+    }
+
+    function removeOwner(address _owner) external onlyOwner {
+        require(isOwner[_owner], "addres is not an owner");
+        isOwner[_owner] = false;
+        for (uint256 i; i < owners.length; i++) {
+            if (owners[i] == _owner) {
+                owners[i] = owners[owners.length - 1];
+                owners.pop();
+            }
+        }
     }
 }
